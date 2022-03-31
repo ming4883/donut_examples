@@ -95,23 +95,24 @@ private:
     nvrhi::CommandListHandle m_CommandList;
 
     std::unique_ptr<tf::Executor> m_Executor;
+
+    struct RenderPhase
+    {
+        std::shared_ptr<engine::FramebufferFactory> m_Framebuffer;
+        std::unique_ptr<ExampleForwardShadingPass> m_GeomPass;
+        app::FirstPersonCamera m_Camera;
+        engine::PlanarView m_View;
+    };
     
-    std::shared_ptr<engine::FramebufferFactory> m_SceneFramebuffer;
-    std::shared_ptr<engine::FramebufferFactory> m_ShadowmapFramebuffer;
+    RenderPhase m_MainPhase;
+    RenderPhase m_ShadowmapPhase;
     
-    std::unique_ptr<ExampleForwardShadingPass> m_ScenePass;
-    std::unique_ptr<ExampleForwardShadingPass> m_ShadowmapPass;
+    uint32_t m_shadowMapSize = 512;
+    
     std::shared_ptr<engine::ShaderFactory> m_ShaderFactory;
     std::unique_ptr<engine::Scene> m_Scene;
+    std::shared_ptr<engine::DirectionalLight> m_SunLight;
     std::unique_ptr<engine::BindingCache> m_BindingCache;
-
-    app::FirstPersonCamera m_SceneCamera;
-    engine::PlanarView m_SceneView;
-
-    app::FirstPersonCamera m_ShadowmapCamera;
-    engine::PlanarView m_ShadowmapView;
-
-    uint32_t m_shadowMapSize = 512;
 
 public:
     using ApplicationBase::ApplicationBase;
@@ -138,19 +139,29 @@ public:
         SetAsynchronousLoadingEnabled(false);
         BeginLoadingScene(nativeFS, sceneFileName);
 
+        m_SunLight = std::make_shared<engine::DirectionalLight>();
+        m_Scene->GetSceneGraph()->AttachLeafNode(m_Scene->GetSceneGraph()->GetRootNode(), m_SunLight);
+
+        m_SunLight->SetDirection(double3(0.1, -1.0, 0.15));
+        m_SunLight->irradiance = 1.f;
+
         m_Scene->FinishedLoading(GetFrameIndex());
+        
         auto aabb = m_Scene->GetSceneGraph()->GetRootNode()->GetGlobalBoundingBox();
-        m_SceneCamera.LookAt((aabb.m_maxs - aabb.center())* 2.0f + aabb.center(), aabb.center());
-        m_SceneCamera.SetMoveSpeed(length(aabb.m_maxs - aabb.m_mins) * 0.1f);
+        m_MainPhase.m_Camera.LookAt((aabb.m_maxs - aabb.center())* 2.0f + aabb.center(), aabb.center());
+        m_MainPhase.m_Camera.SetMoveSpeed(length(aabb.m_maxs - aabb.m_mins) * 0.1f);
+
+        render::ForwardShadingPass::CreateParameters forwardParams;
+        forwardParams.numConstantBufferVersions = 128;
+        
+        m_MainPhase.m_GeomPass = std::make_unique<ExampleForwardShadingPass>(GetDevice(), m_CommonPasses, false);
+        m_MainPhase.m_GeomPass->Init(*m_ShaderFactory, forwardParams);
+
+        m_ShadowmapPhase.m_GeomPass = std::make_unique<ExampleForwardShadingPass>(GetDevice(), m_CommonPasses, true);
+        m_ShadowmapPhase.m_GeomPass->Init(*m_ShaderFactory, forwardParams);
         
         m_CommandList = GetDevice()->createCommandList();
 
-        m_ScenePass = std::make_unique<ExampleForwardShadingPass>(GetDevice(), m_CommonPasses, false);
-        m_ShadowmapPass = std::make_unique<ExampleForwardShadingPass>(GetDevice(), m_CommonPasses, true);
-        render::ForwardShadingPass::CreateParameters forwardParams;
-        forwardParams.numConstantBufferVersions = 128;
-        m_ScenePass->Init(*m_ShaderFactory, forwardParams);
-        m_ShadowmapPass->Init(*m_ShaderFactory, forwardParams);
         return true;
     }
 
@@ -169,7 +180,7 @@ public:
 
     bool KeyboardUpdate(int key, int scancode, int action, int mods) override
     {
-        m_SceneCamera.KeyboardUpdate(key, scancode, action, mods);
+        m_MainPhase.m_Camera.KeyboardUpdate(key, scancode, action, mods);
 
         if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
         {
@@ -181,19 +192,19 @@ public:
 
     bool MousePosUpdate(double xpos, double ypos) override
     {
-        m_SceneCamera.MousePosUpdate(xpos, ypos);
+        m_MainPhase.m_Camera.MousePosUpdate(xpos, ypos);
         return true;
     }
 
     bool MouseButtonUpdate(int button, int action, int mods) override
     {
-        m_SceneCamera.MouseButtonUpdate(button, action, mods);
+        m_MainPhase.m_Camera.MouseButtonUpdate(button, action, mods);
         return true;
     }
 
     void Animate(float fElapsedTimeSeconds) override
     {
-        m_SceneCamera.Animate(fElapsedTimeSeconds);
+        m_MainPhase.m_Camera.Animate(fElapsedTimeSeconds);
 
         GetDeviceManager()->SetInformativeWindowTitle(g_WindowTitle,"NONE");
     }
@@ -201,12 +212,12 @@ public:
     void BackBufferResizing() override
     { 
         m_BindingCache->Clear();
-        m_SceneFramebuffer = nullptr;
+        m_MainPhase.m_Framebuffer = nullptr;
     }
 
     void EnsureFramebuffers(const nvrhi::FramebufferInfo& fbinfo)
     {
-        if (!m_SceneFramebuffer)
+        if (!m_MainPhase.m_Framebuffer)
         {
             auto textureDesc = nvrhi::TextureDesc()
                 .setDimension(nvrhi::TextureDimension::Texture2D)
@@ -226,12 +237,12 @@ public:
                 .setFormat(nvrhi::Format::D32)
                 .setInitialState(nvrhi::ResourceStates::DepthWrite));
 
-            m_SceneFramebuffer = std::make_unique<engine::FramebufferFactory>(GetDevice());
-            m_SceneFramebuffer->RenderTargets.push_back(colorBuffer);
-            m_SceneFramebuffer->DepthTarget = depthBuffer;
+            m_MainPhase.m_Framebuffer = std::make_unique<engine::FramebufferFactory>(GetDevice());
+            m_MainPhase.m_Framebuffer->RenderTargets.push_back(colorBuffer);
+            m_MainPhase.m_Framebuffer->DepthTarget = depthBuffer;
         }
 
-        if (!m_ShadowmapFramebuffer)
+        if (!m_ShadowmapPhase.m_Framebuffer)
         {
             auto textureDesc = nvrhi::TextureDesc()
                 .setDimension(nvrhi::TextureDimension::Texture2D)
@@ -251,9 +262,9 @@ public:
                 .setFormat(nvrhi::Format::D32)
                 .setInitialState(nvrhi::ResourceStates::DepthWrite));
 
-            m_ShadowmapFramebuffer = std::make_unique<engine::FramebufferFactory>(GetDevice());
-            m_ShadowmapFramebuffer->RenderTargets.push_back(colorBuffer);
-            m_ShadowmapFramebuffer->DepthTarget = depthBuffer;
+            m_ShadowmapPhase.m_Framebuffer = std::make_unique<engine::FramebufferFactory>(GetDevice());
+            m_ShadowmapPhase.m_Framebuffer->RenderTargets.push_back(colorBuffer);
+            m_ShadowmapPhase.m_Framebuffer->DepthTarget = depthBuffer;
         }
     }
 
@@ -270,125 +281,48 @@ public:
         }
 
         auto eyeat = lookat + lightDir * r_max;
-        m_ShadowmapCamera.LookAt(eyeat, lookat, m_SceneCamera.GetUp());
+        m_ShadowmapPhase.m_Camera.LookAt(eyeat, lookat, float3(0, 1, 0));
 
-        m_ShadowmapView.SetViewport(nvrhi::Viewport(static_cast<float>(m_shadowMapSize), static_cast<float>(m_shadowMapSize)));
-        m_ShadowmapView.SetMatrices(m_ShadowmapCamera.GetWorldToViewMatrix(), orthoProjD3DStyle(-r_max, r_max, r_max, -r_max, 0.0, 2 * r_max));
-        m_ShadowmapView.UpdateCache();
+        m_ShadowmapPhase.m_View.SetViewport(nvrhi::Viewport(static_cast<float>(m_shadowMapSize), static_cast<float>(m_shadowMapSize)));
+        m_ShadowmapPhase.m_View.SetMatrices(m_ShadowmapPhase.m_Camera.GetWorldToViewMatrix(), orthoProjD3DStyle(-r_max, r_max, r_max, -r_max, 0.0, 2 * r_max));
+        m_ShadowmapPhase.m_View.UpdateCache();
     }
 
     void RenderShadowMapView(nvrhi::ICommandList* commandList)
     {
-        const float3 lightDir(0, 1, 0);
-        SetupShadowMapView(lightDir);
+        SetupShadowMapView(-float3(m_SunLight->GetDirection()));
 
         render::InstancedOpaqueDrawStrategy strategy;
 
-        commandList->clearDepthStencilTexture(m_ShadowmapFramebuffer->DepthTarget, nvrhi::AllSubresources, true, 1.f, true, 0);
-        commandList->clearTextureFloat(m_ShadowmapFramebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(1.f));
+        commandList->clearDepthStencilTexture(m_ShadowmapPhase.m_Framebuffer->DepthTarget, nvrhi::AllSubresources, true, 1.f, true, 0);
+        commandList->clearTextureFloat(m_ShadowmapPhase.m_Framebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(1.f));
 
         render::ForwardShadingPass::Context context;
-        m_ShadowmapPass->PrepareLights(context, commandList, {}, 1.0f, 0.3f, {});
+        m_ShadowmapPhase.m_GeomPass->PrepareLights(context, commandList, {}, 0.0f, 0.0f, {});
 
-        render::RenderCompositeView(commandList, &m_ShadowmapView, &m_ShadowmapView, *m_ShadowmapFramebuffer,
-            m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ShadowmapPass, context);
+        render::RenderCompositeView(commandList, &m_ShadowmapPhase.m_View, &m_ShadowmapPhase.m_View, *m_ShadowmapPhase.m_Framebuffer,
+            m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ShadowmapPhase.m_GeomPass, context);
     }
 
     void RenderSceneView(nvrhi::ICommandList* commandList, const nvrhi::Viewport& viewport)
     {
         render::InstancedOpaqueDrawStrategy strategy;
 
-        m_SceneView.SetViewport(viewport);
-        m_SceneView.SetMatrices(m_SceneCamera.GetWorldToViewMatrix(), perspProjD3DStyleReverse(dm::PI_f * 0.25f, viewport.width() / viewport.height(), 0.1f));
-        m_SceneView.UpdateCache();
+        m_MainPhase.m_View.SetViewport(viewport);
+        m_MainPhase.m_View.SetMatrices(m_MainPhase.m_Camera.GetWorldToViewMatrix(), perspProjD3DStyleReverse(dm::PI_f * 0.25f, viewport.width() / viewport.height(), 0.1f));
+        m_MainPhase.m_View.UpdateCache();
 
-        commandList->clearDepthStencilTexture(m_SceneFramebuffer->DepthTarget, nvrhi::AllSubresources, true, 0.f, true, 0);
-        commandList->clearTextureFloat(m_SceneFramebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(0.f));
+        commandList->clearDepthStencilTexture(m_MainPhase.m_Framebuffer->DepthTarget, nvrhi::AllSubresources, true, 0.f, true, 0);
+        commandList->clearTextureFloat(m_MainPhase.m_Framebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(0.f));
 
         render::ForwardShadingPass::Context context;
-        m_ScenePass->PrepareLights(context, commandList, {}, 1.0f, 0.3f, {});
-        render::RenderCompositeView(commandList, &m_SceneView, &m_SceneView, *m_SceneFramebuffer,
-            m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ScenePass, context);
-   
+         m_MainPhase.m_GeomPass->PrepareLights(context, commandList, m_Scene->GetSceneGraph()->GetLights(), 0.25f, 0.0625f, {});
+        render::RenderCompositeView(commandList, &m_MainPhase.m_View, &m_MainPhase.m_View, *m_MainPhase.m_Framebuffer,
+            m_Scene->GetSceneGraph()->GetRootNode(), strategy, * m_MainPhase.m_GeomPass, context);
     }
     
     void Render(nvrhi::IFramebuffer* framebuffer) override
     {
-        /*
-        dm::affine viewMatrix = m_Camera.GetWorldToViewMatrix();
-        m_CubemapView.SetTransform(viewMatrix, 0.1f, 100.f);
-        m_CubemapView.UpdateCache();
-
-        tf::Taskflow taskFlow;
-        if (m_UseThreads)
-        {
-            for (int face = 0; face < 6; face++)
-            {
-                taskFlow.emplace([this, face]() { RenderCubeFace(face); });
-            }
-
-            m_Executor->run(taskFlow);
-        }
-        else
-        {
-            for (int face = 0; face < 6; face++)
-            {
-                RenderCubeFace(face);
-            }
-        }
-        
-        m_CommandList->open();
-
-        const std::vector<std::pair<int, int>> faceLayout = {
-            { 3, 1 },
-            { 1, 1 },
-            { 2, 0 },
-            { 2, 2 },
-            { 2, 1 },
-            { 0, 1 }
-        };
-
-        auto fbinfo = framebuffer->getFramebufferInfo();
-        int faceSize = std::min(fbinfo.width / 4, fbinfo.height / 3);
-
-        for (int face = 0; face < 6; face++)
-        {
-            nvrhi::Viewport viewport;
-            viewport.minX = float(faceLayout[face].first * faceSize);
-            viewport.maxX = viewport.minX + float(faceSize);
-            viewport.minY = float(faceLayout[face].second * faceSize);
-            viewport.maxY = viewport.minY + float(faceSize);
-            viewport.minZ = 0.f;
-            viewport.maxZ = 1.f;
-
-            engine::BlitParameters blitParams;
-            blitParams.targetFramebuffer = framebuffer;
-            blitParams.targetViewport = viewport;
-            blitParams.sourceTexture = m_ColorBuffer;
-            blitParams.sourceArraySlice = face;
-            m_CommonPasses->BlitTexture(m_CommandList, blitParams, m_BindingCache.get());
-        }
-        
-        m_CommandList->close();
-
-        if (m_UseThreads)
-        {
-            m_Executor->wait_for_all();
-        }
-
-        nvrhi::ICommandList* commandLists[] = {
-            m_FaceCommandLists[0],
-            m_FaceCommandLists[1],
-            m_FaceCommandLists[2],
-            m_FaceCommandLists[3],
-            m_FaceCommandLists[4],
-            m_FaceCommandLists[5],
-            m_CommandList
-        };
-        
-        GetDevice()->executeCommandLists(commandLists, std::size(commandLists));
-        */
-
         const auto& fbinfo = framebuffer->getFramebufferInfo();
 
         EnsureFramebuffers(fbinfo);
@@ -400,7 +334,26 @@ public:
 
         RenderSceneView(commandList, nvrhi::Viewport(float(fbinfo.width), float(fbinfo.height)));
 
-        m_CommonPasses->BlitTexture(m_CommandList, framebuffer, m_SceneFramebuffer->RenderTargets[0], m_BindingCache.get());
+        m_CommonPasses->BlitTexture(commandList, framebuffer, m_MainPhase.m_Framebuffer->RenderTargets[0], m_BindingCache.get());
+
+        // display shadow map
+        {
+            nvrhi::Viewport viewport;
+            viewport.minX = 0;
+            viewport.maxX = 128;
+            viewport.minY = static_cast<float>(fbinfo.height - 128);
+            viewport.maxY = static_cast<float>(fbinfo.height);
+            viewport.minZ = 0.f;
+            viewport.maxZ = 1.f;
+
+            engine::BlitParameters blitParams;
+            blitParams.targetFramebuffer = framebuffer;
+            blitParams.targetViewport = viewport;
+            blitParams.sourceTexture = m_ShadowmapPhase.m_Framebuffer->RenderTargets[0];
+            blitParams.sourceArraySlice = 0;
+            m_CommonPasses->BlitTexture(commandList, blitParams, m_BindingCache.get());
+        }
+        
         commandList->close();
         GetDevice()->executeCommandList(commandList);
     }

@@ -78,6 +78,30 @@ void main(
     if (g_Material.domain != MaterialDomain_Opaque)
         clip(surfaceMaterial.opacity - g_Material.alphaCutoff);
 
+    float4 cameraDirectionOrPosition = g_ForwardView.view.cameraDirectionOrPosition;
+    float3 viewIncident = GetIncidentVector(cameraDirectionOrPosition, surfaceWorldPos);
+    
+    float3 diffuseTerm = 0;
+    float3 specularTerm = 0;
+    
+    [loop]
+    for(uint nLight = 0; nLight < g_ForwardLight.numLights; nLight++)
+    {
+        LightConstants light = g_ForwardLight.lights[nLight];
+
+        float3 diffuseRadiance, specularRadiance;
+        ShadeSurface(light, surfaceMaterial, surfaceWorldPos, viewIncident, diffuseRadiance, specularRadiance);
+
+        diffuseTerm += (diffuseRadiance) * light.color;
+        specularTerm += (specularRadiance) * light.color;
+    }
+
+    {
+        float3 ambientColor = lerp(g_ForwardLight.ambientColorBottom.rgb, g_ForwardLight.ambientColorTop.rgb, surfaceMaterial.shadingNormal.y * 0.5 + 0.5);
+
+        diffuseTerm += ambientColor * surfaceMaterial.diffuseAlbedo * surfaceMaterial.occlusion;
+        specularTerm += ambientColor * surfaceMaterial.specularF0 * surfaceMaterial.occlusion;
+    }
     
 #if TRANSMISSIVE_MATERIAL
     
@@ -94,7 +118,7 @@ void main(
 
 #endif // TRANSMISSIVE_MATERIAL
 
-    o_color.rgb = surfaceMaterial.diffuseAlbedo;
+    o_color.rgb = diffuseTerm + specularTerm;
     o_color.a = surfaceMaterial.opacity;
 
 
