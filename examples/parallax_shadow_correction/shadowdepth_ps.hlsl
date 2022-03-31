@@ -62,40 +62,7 @@ void main(
     in SceneVertex i_vtx,
     in bool i_isFrontFace : SV_IsFrontFace,
     out float4 o_color : SV_Target0
-#if TRANSMISSIVE_MATERIAL
-    , out float4 o_backgroundBlendFactor : SV_Target1
-#endif
 )
 {
-    MaterialTextureSample textures = SampleMaterialTexturesAuto(i_vtx.texCoord);
-
-    MaterialSample surfaceMaterial = EvaluateSceneMaterial(i_vtx.normal, i_vtx.tangent, g_Material, textures);
-    float3 surfaceWorldPos = i_vtx.pos;
-
-    if (!i_isFrontFace)
-        surfaceMaterial.shadingNormal = -surfaceMaterial.shadingNormal;
-
-    if (g_Material.domain != MaterialDomain_Opaque)
-        clip(surfaceMaterial.opacity - g_Material.alphaCutoff);
-
-    
-#if TRANSMISSIVE_MATERIAL
-    
-    // See https://github.com/KhronosGroup/glTF/blob/master/extensions/2.0/Khronos/KHR_materials_transmission/README.md#transmission-btdf
-    float dielectricFresnel = 0.5;
-    float backgroundScalar = surfaceMaterial.transmission
-        * (1.0 - dielectricFresnel);
-
-    if (g_Material.domain == MaterialDomain_TransmissiveAlphaBlended)
-        backgroundScalar *= (1.0 - surfaceMaterial.opacity);
-    
-    o_backgroundBlendFactor.rgb = backgroundScalar;
-    o_backgroundBlendFactor.a = 1.0;
-
-#endif // TRANSMISSIVE_MATERIAL
-
-    o_color.rgb = surfaceMaterial.diffuseAlbedo;
-    o_color.a = surfaceMaterial.opacity;
-
-
+    o_color = i_position.zzzz / i_position.w;
 }

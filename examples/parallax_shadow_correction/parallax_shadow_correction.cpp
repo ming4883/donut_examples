@@ -47,25 +47,43 @@ class ExampleForwardShadingPass : public render::ForwardShadingPass
 public:
     ExampleForwardShadingPass(
             nvrhi::IDevice* device,
-            std::shared_ptr<engine::CommonRenderPasses> commonPasses) :
+            std::shared_ptr<engine::CommonRenderPasses> commonPasses,
+            bool isShadowmapPass) :
     ForwardShadingPass(
         device,
         commonPasses)
     {
-        
+        m_IsShadowPass = isShadowmapPass;
     }
+    
 protected:
+    bool m_IsShadowPass = false;
+    
     virtual nvrhi::ShaderHandle CreateVertexShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params)
     {
-        return shaderFactory.CreateShader("km/forward_vs.hlsl", "main", nullptr, nvrhi::ShaderType::Vertex);
-        
+        if (m_IsShadowPass)
+        {
+            return shaderFactory.CreateShader("km/shadowdepth_vs.hlsl", "main", nullptr, nvrhi::ShaderType::Vertex);
+        }
+        else
+        {
+            return shaderFactory.CreateShader("km/forward_vs.hlsl", "main", nullptr, nvrhi::ShaderType::Vertex);
+        }
     }
     virtual nvrhi::ShaderHandle CreatePixelShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params, bool transmissiveMaterial)
     {
         std::vector<engine::ShaderMacro> Macros;
         Macros.push_back(engine::ShaderMacro("TRANSMISSIVE_MATERIAL", transmissiveMaterial ? "1" : "0"));
 
-        return shaderFactory.CreateShader("km/forward_ps.hlsl", "main", &Macros, nvrhi::ShaderType::Pixel);
+        if (m_IsShadowPass)
+        {
+            return shaderFactory.CreateShader("km/shadowdepth_ps.hlsl", "main", &Macros, nvrhi::ShaderType::Pixel);
+        }
+        else
+        {
+            
+            return shaderFactory.CreateShader("km/forward_ps.hlsl", "main", &Macros, nvrhi::ShaderType::Pixel);   
+        }
     }
 };
 
@@ -79,14 +97,21 @@ private:
     std::unique_ptr<tf::Executor> m_Executor;
     
     std::shared_ptr<engine::FramebufferFactory> m_SceneFramebuffer;
+    std::shared_ptr<engine::FramebufferFactory> m_ShadowmapFramebuffer;
     
-    std::unique_ptr<ExampleForwardShadingPass> m_ForwardShadingPass;
+    std::unique_ptr<ExampleForwardShadingPass> m_ScenePass;
+    std::unique_ptr<ExampleForwardShadingPass> m_ShadowmapPass;
     std::shared_ptr<engine::ShaderFactory> m_ShaderFactory;
     std::unique_ptr<engine::Scene> m_Scene;
     std::unique_ptr<engine::BindingCache> m_BindingCache;
 
-    app::FirstPersonCamera m_Camera;
-    engine::PlanarView m_View;
+    app::FirstPersonCamera m_SceneCamera;
+    engine::PlanarView m_SceneView;
+
+    app::FirstPersonCamera m_ShadowmapCamera;
+    engine::PlanarView m_ShadowmapView;
+
+    uint32_t m_shadowMapSize = 512;
 
 public:
     using ApplicationBase::ApplicationBase;
@@ -115,19 +140,19 @@ public:
 
         m_Scene->FinishedLoading(GetFrameIndex());
         auto aabb = m_Scene->GetSceneGraph()->GetRootNode()->GetGlobalBoundingBox();
-        m_Camera.LookAt((aabb.m_maxs - aabb.center())* 2.0f + aabb.center(), aabb.center());
-        m_Camera.SetMoveSpeed(length(aabb.m_maxs - aabb.m_mins) * 0.1f);
+        m_SceneCamera.LookAt((aabb.m_maxs - aabb.center())* 2.0f + aabb.center(), aabb.center());
+        m_SceneCamera.SetMoveSpeed(length(aabb.m_maxs - aabb.m_mins) * 0.1f);
         
         m_CommandList = GetDevice()->createCommandList();
 
-        m_ForwardShadingPass = std::make_unique<ExampleForwardShadingPass>(GetDevice(), m_CommonPasses);
+        m_ScenePass = std::make_unique<ExampleForwardShadingPass>(GetDevice(), m_CommonPasses, false);
+        m_ShadowmapPass = std::make_unique<ExampleForwardShadingPass>(GetDevice(), m_CommonPasses, true);
         render::ForwardShadingPass::CreateParameters forwardParams;
         forwardParams.numConstantBufferVersions = 128;
-        m_ForwardShadingPass->Init(*m_ShaderFactory, forwardParams);
-
+        m_ScenePass->Init(*m_ShaderFactory, forwardParams);
+        m_ShadowmapPass->Init(*m_ShaderFactory, forwardParams);
         return true;
     }
-    
 
     bool LoadScene(std::shared_ptr<vfs::IFileSystem> fs, const std::filesystem::path& sceneFileName) override 
     {
@@ -144,7 +169,7 @@ public:
 
     bool KeyboardUpdate(int key, int scancode, int action, int mods) override
     {
-        m_Camera.KeyboardUpdate(key, scancode, action, mods);
+        m_SceneCamera.KeyboardUpdate(key, scancode, action, mods);
 
         if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
         {
@@ -156,19 +181,19 @@ public:
 
     bool MousePosUpdate(double xpos, double ypos) override
     {
-        m_Camera.MousePosUpdate(xpos, ypos);
+        m_SceneCamera.MousePosUpdate(xpos, ypos);
         return true;
     }
 
     bool MouseButtonUpdate(int button, int action, int mods) override
     {
-        m_Camera.MouseButtonUpdate(button, action, mods);
+        m_SceneCamera.MouseButtonUpdate(button, action, mods);
         return true;
     }
 
     void Animate(float fElapsedTimeSeconds) override
     {
-        m_Camera.Animate(fElapsedTimeSeconds);
+        m_SceneCamera.Animate(fElapsedTimeSeconds);
 
         GetDeviceManager()->SetInformativeWindowTitle(g_WindowTitle,"NONE");
     }
@@ -179,7 +204,114 @@ public:
         m_SceneFramebuffer = nullptr;
     }
 
+    void EnsureFramebuffers(const nvrhi::FramebufferInfo& fbinfo)
+    {
+        if (!m_SceneFramebuffer)
+        {
+            auto textureDesc = nvrhi::TextureDesc()
+                .setDimension(nvrhi::TextureDimension::Texture2D)
+                .setWidth(fbinfo.width)
+                .setHeight(fbinfo.height)
+                .setClearValue(nvrhi::Color(0.f))
+                .setIsRenderTarget(true)
+                .setKeepInitialState(true);
 
+            auto colorBuffer = GetDevice()->createTexture(textureDesc
+                .setDebugName("SceneColorBuffer")
+                .setFormat(nvrhi::Format::SRGBA8_UNORM)
+                .setInitialState(nvrhi::ResourceStates::RenderTarget));
+
+            auto depthBuffer = GetDevice()->createTexture(textureDesc
+                .setDebugName("SceneDepthBuffer")
+                .setFormat(nvrhi::Format::D32)
+                .setInitialState(nvrhi::ResourceStates::DepthWrite));
+
+            m_SceneFramebuffer = std::make_unique<engine::FramebufferFactory>(GetDevice());
+            m_SceneFramebuffer->RenderTargets.push_back(colorBuffer);
+            m_SceneFramebuffer->DepthTarget = depthBuffer;
+        }
+
+        if (!m_ShadowmapFramebuffer)
+        {
+            auto textureDesc = nvrhi::TextureDesc()
+                .setDimension(nvrhi::TextureDimension::Texture2D)
+                .setWidth(m_shadowMapSize)
+                .setHeight(m_shadowMapSize)
+                .setClearValue(nvrhi::Color(0.f))
+                .setIsRenderTarget(true)
+                .setKeepInitialState(true);
+
+            auto colorBuffer = GetDevice()->createTexture(textureDesc
+                .setDebugName("ShadowMapColorBuffer")
+                .setFormat(nvrhi::Format::R32_FLOAT)
+                .setInitialState(nvrhi::ResourceStates::RenderTarget));
+
+            auto depthBuffer = GetDevice()->createTexture(textureDesc
+                .setDebugName("ShadowMapDepthBuffer")
+                .setFormat(nvrhi::Format::D32)
+                .setInitialState(nvrhi::ResourceStates::DepthWrite));
+
+            m_ShadowmapFramebuffer = std::make_unique<engine::FramebufferFactory>(GetDevice());
+            m_ShadowmapFramebuffer->RenderTargets.push_back(colorBuffer);
+            m_ShadowmapFramebuffer->DepthTarget = depthBuffer;
+        }
+    }
+
+    void SetupShadowMapView(const donut::math::float3& lightDir)
+    {
+        auto aabb = m_Scene->GetSceneGraph()->GetRootNode()->GetGlobalBoundingBox();
+        auto lookat = aabb.center();
+
+        float r_max = 0;
+        for(uint32_t i = 0; i < 8; ++i)
+        {
+            float r = length(aabb.getCorner(i) - lookat);
+            r_max = donut::math::max(r, r_max);
+        }
+
+        auto eyeat = lookat + lightDir * r_max;
+        m_ShadowmapCamera.LookAt(eyeat, lookat, m_SceneCamera.GetUp());
+
+        m_ShadowmapView.SetViewport(nvrhi::Viewport(static_cast<float>(m_shadowMapSize), static_cast<float>(m_shadowMapSize)));
+        m_ShadowmapView.SetMatrices(m_ShadowmapCamera.GetWorldToViewMatrix(), orthoProjD3DStyle(-r_max, r_max, r_max, -r_max, 0.0, 2 * r_max));
+        m_ShadowmapView.UpdateCache();
+    }
+
+    void RenderShadowMapView(nvrhi::ICommandList* commandList)
+    {
+        const float3 lightDir(0, 1, 0);
+        SetupShadowMapView(lightDir);
+
+        render::InstancedOpaqueDrawStrategy strategy;
+
+        commandList->clearDepthStencilTexture(m_ShadowmapFramebuffer->DepthTarget, nvrhi::AllSubresources, true, 1.f, true, 0);
+        commandList->clearTextureFloat(m_ShadowmapFramebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(1.f));
+
+        render::ForwardShadingPass::Context context;
+        m_ShadowmapPass->PrepareLights(context, commandList, {}, 1.0f, 0.3f, {});
+
+        render::RenderCompositeView(commandList, &m_ShadowmapView, &m_ShadowmapView, *m_ShadowmapFramebuffer,
+            m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ShadowmapPass, context);
+    }
+
+    void RenderSceneView(nvrhi::ICommandList* commandList, const nvrhi::Viewport& viewport)
+    {
+        render::InstancedOpaqueDrawStrategy strategy;
+
+        m_SceneView.SetViewport(viewport);
+        m_SceneView.SetMatrices(m_SceneCamera.GetWorldToViewMatrix(), perspProjD3DStyleReverse(dm::PI_f * 0.25f, viewport.width() / viewport.height(), 0.1f));
+        m_SceneView.UpdateCache();
+
+        commandList->clearDepthStencilTexture(m_SceneFramebuffer->DepthTarget, nvrhi::AllSubresources, true, 0.f, true, 0);
+        commandList->clearTextureFloat(m_SceneFramebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(0.f));
+
+        render::ForwardShadingPass::Context context;
+        m_ScenePass->PrepareLights(context, commandList, {}, 1.0f, 0.3f, {});
+        render::RenderCompositeView(commandList, &m_SceneView, &m_SceneView, *m_SceneFramebuffer,
+            m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ScenePass, context);
+   
+    }
+    
     void Render(nvrhi::IFramebuffer* framebuffer) override
     {
         /*
@@ -257,54 +389,18 @@ public:
         GetDevice()->executeCommandLists(commandLists, std::size(commandLists));
         */
 
-        const auto fbinfo = framebuffer->getFramebufferInfo();
+        const auto& fbinfo = framebuffer->getFramebufferInfo();
 
-        if (!m_SceneFramebuffer)
-        {
-            auto textureDesc = nvrhi::TextureDesc()
-                .setDimension(nvrhi::TextureDimension::Texture2D)
-                .setWidth(fbinfo.width)
-                .setHeight(fbinfo.height)
-                .setClearValue(nvrhi::Color(0.f))
-                .setIsRenderTarget(true)
-                .setKeepInitialState(true);
-
-            auto colorBuffer = GetDevice()->createTexture(textureDesc
-                .setDebugName("ColorBuffer")
-                .setFormat(nvrhi::Format::SRGBA8_UNORM)
-                .setInitialState(nvrhi::ResourceStates::RenderTarget));
-
-            auto depthBuffer = GetDevice()->createTexture(textureDesc
-                .setDebugName("DepthBuffer")
-                .setFormat(nvrhi::Format::D32)
-                .setInitialState(nvrhi::ResourceStates::DepthWrite));
-
-            m_SceneFramebuffer = std::make_unique<engine::FramebufferFactory>(GetDevice());
-            m_SceneFramebuffer->RenderTargets.push_back(colorBuffer);
-            m_SceneFramebuffer->DepthTarget = depthBuffer;
-        }
+        EnsureFramebuffers(fbinfo);
 
         nvrhi::ICommandList* commandList = m_CommandList;
         commandList->open();
 
-        commandList->clearDepthStencilTexture(m_SceneFramebuffer->DepthTarget, nvrhi::AllSubresources, true, 0.f, true, 0);
-        commandList->clearTextureFloat(m_SceneFramebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(0.f));
+        RenderShadowMapView(commandList);
 
-        render::ForwardShadingPass::Context context;
-        m_ForwardShadingPass->PrepareLights(context, commandList, {}, 1.0f, 0.3f, {});
-
-        render::InstancedOpaqueDrawStrategy strategy;
-
-        nvrhi::Viewport windowViewport(float(fbinfo.width), float(fbinfo.height));
-        m_View.SetViewport(windowViewport);
-        m_View.SetMatrices(m_Camera.GetWorldToViewMatrix(), perspProjD3DStyleReverse(dm::PI_f * 0.25f, windowViewport.width() / windowViewport.height(), 0.1f));
-        m_View.UpdateCache();
-
-        render::RenderCompositeView(commandList, &m_View, &m_View, *m_SceneFramebuffer,
-            m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ForwardShadingPass, context);
+        RenderSceneView(commandList, nvrhi::Viewport(float(fbinfo.width), float(fbinfo.height)));
 
         m_CommonPasses->BlitTexture(m_CommandList, framebuffer, m_SceneFramebuffer->RenderTargets[0], m_BindingCache.get());
-        
         commandList->close();
         GetDevice()->executeCommandList(commandList);
     }
