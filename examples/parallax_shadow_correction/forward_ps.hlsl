@@ -29,6 +29,7 @@
 #include <donut/shaders/lighting.hlsli>
 #include <donut/shaders/shadows.hlsli>
 #include <donut/shaders/vulkan.hlsli>
+#include "./parallax_shadow_correction_cb.h"
 
 cbuffer c_ForwardView : register(b1 VK_DESCRIPTOR_SET(1))
 {
@@ -40,6 +41,12 @@ cbuffer c_ForwardLight : register(b2 VK_DESCRIPTOR_SET(1))
     ForwardShadingLightConstants g_ForwardLight;
 };
 
+cbuffer c_ParallaxShadowCorrection : register(b3 VK_DESCRIPTOR_SET(1))
+{
+    ParallaxShadowCorrectionConstants g_ParallaxShadow;
+};
+
+/*
 Texture2DArray t_ShadowMapArray : register(t10 VK_DESCRIPTOR_SET(2));
 TextureCubeArray t_DiffuseLightProbe : register(t11 VK_DESCRIPTOR_SET(2));
 TextureCubeArray t_SpecularLightProbe : register(t12 VK_DESCRIPTOR_SET(2));
@@ -48,6 +55,10 @@ Texture2D t_EnvironmentBrdf : register(t13 VK_DESCRIPTOR_SET(2));
 SamplerState s_ShadowSampler : register(s1 VK_DESCRIPTOR_SET(1));
 SamplerState s_LightProbeSampler : register(s2 VK_DESCRIPTOR_SET(2));
 SamplerState s_BrdfSampler : register(s3 VK_DESCRIPTOR_SET(2));
+*/
+
+Texture2D t_ShadowMap : register(t10 VK_DESCRIPTOR_SET(2));
+SamplerState s_ShadowSampler : register(s1 VK_DESCRIPTOR_SET(1));
 
 float3 GetIncidentVector(float4 directionOrPosition, float3 surfacePos)
 {
@@ -96,12 +107,21 @@ void main(
         specularTerm += (specularRadiance) * light.color;
     }
 
+    float4 shadowPos = mul(float4(i_vtx.pos, 1), g_ParallaxShadow.cacheWorldToShadow);
+    shadowPos.xyz /= shadowPos.www;
+
+    float4 shadowCasterZ = t_ShadowMap.Sample(s_ShadowSampler, shadowPos.xy * 0.5 + 0.5);
+    float shadowTerm = shadowCasterZ.x < (shadowPos.z - 1e-2) ? 0 : 1;
+    diffuseTerm.xyz *= shadowTerm;
+    specularTerm.xyz *= shadowTerm;
+    
     {
         float3 ambientColor = lerp(g_ForwardLight.ambientColorBottom.rgb, g_ForwardLight.ambientColorTop.rgb, surfaceMaterial.shadingNormal.y * 0.5 + 0.5);
 
         diffuseTerm += ambientColor * surfaceMaterial.diffuseAlbedo * surfaceMaterial.occlusion;
         specularTerm += ambientColor * surfaceMaterial.specularF0 * surfaceMaterial.occlusion;
     }
+
     
 #if TRANSMISSIVE_MATERIAL
     

@@ -23,7 +23,7 @@ file(GLOB shaders "*.hlsl" "*.cfg")
 file(GLOB sources "*.cpp" "*.h")
 
 set(project parallax_shadow_correction)
-set(folder "Examples/KM")
+set(folder "KM/Parallax Shadow Correction")
 
 donut_compile_shaders_all_platforms(
     TARGET ${project}_shaders

@@ -1,24 +1,3 @@
-/*
-* Copyright (c) 2014-2021, NVIDIA CORPORATION. All rights reserved.
-*
-* Permission is hereby granted, free of charge, to any person obtaining a
-* copy of this software and associated documentation files (the "Software"),
-* to deal in the Software without restriction, including without limitation
-* the rights to use, copy, modify, merge, publish, distribute, sublicense,
-* and/or sell copies of the Software, and to permit persons to whom the
-* Software is furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
-* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-* DEALINGS IN THE SOFTWARE.
-*/
 
 #include <donut/render/DrawStrategy.h>
 #include <donut/render/ForwardShadingPass.h>
@@ -40,26 +19,52 @@
 using namespace donut;
 using namespace donut::math;
 
+#include "parallax_shadow_correction_cb.h"
+
 static const char* g_WindowTitle = "Parallax Shadow Correction";
 
 class ExampleForwardShadingPass : public render::ForwardShadingPass
 {
+    typedef ForwardShadingPass Super;
 public:
     ExampleForwardShadingPass(
             nvrhi::IDevice* device,
             std::shared_ptr<engine::CommonRenderPasses> commonPasses,
             bool isShadowmapPass) :
-    ForwardShadingPass(
+    Super(
         device,
         commonPasses)
     {
         m_IsShadowPass = isShadowmapPass;
     }
+
+    virtual void Init(
+        engine::ShaderFactory& shaderFactory,
+        const CreateParameters& params) override
+    {
+        if (!m_IsShadowPass)
+            m_ParallaxShadowCB = m_Device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(sizeof(ParallaxShadowCorrectionConstants), "ParallaxShadowCorrectionConstants", params.numConstantBufferVersions));
+        Super::Init(shaderFactory, params);
+    }
+    
+    void PreparegParallaxShadow(
+        Context& context,
+        nvrhi::ICommandList* commandList,
+        const ParallaxShadowCorrectionConstants& constants,
+        nvrhi::ITexture* shadowMapTexture)
+    {
+        if (!m_IsShadowPass)
+        {
+            commandList->writeBuffer(m_ParallaxShadowCB, &constants, sizeof(constants));
+            context.lightBindingSet = CreateLightBindingSet(shadowMapTexture, nullptr, nullptr, nullptr);
+        }
+    }
     
 protected:
     bool m_IsShadowPass = false;
+    nvrhi::BufferHandle m_ParallaxShadowCB;
     
-    virtual nvrhi::ShaderHandle CreateVertexShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params)
+    virtual nvrhi::ShaderHandle CreateVertexShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params) override
     {
         if (m_IsShadowPass)
         {
@@ -70,7 +75,7 @@ protected:
             return shaderFactory.CreateShader("km/forward_vs.hlsl", "main", nullptr, nvrhi::ShaderType::Vertex);
         }
     }
-    virtual nvrhi::ShaderHandle CreatePixelShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params, bool transmissiveMaterial)
+    virtual nvrhi::ShaderHandle CreatePixelShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params, bool transmissiveMaterial) override
     {
         std::vector<engine::ShaderMacro> Macros;
         Macros.push_back(engine::ShaderMacro("TRANSMISSIVE_MATERIAL", transmissiveMaterial ? "1" : "0"));
@@ -84,6 +89,41 @@ protected:
             
             return shaderFactory.CreateShader("km/forward_ps.hlsl", "main", &Macros, nvrhi::ShaderType::Pixel);   
         }
+    }
+
+
+    virtual nvrhi::BindingLayoutHandle CreateViewBindingLayout() override
+    {
+        if (m_IsShadowPass)
+            return Super::CreateViewBindingLayout();
+        
+        nvrhi::BindingLayoutDesc viewLayoutDesc;
+        viewLayoutDesc.visibility = nvrhi::ShaderType::All;
+        viewLayoutDesc.bindings = {
+            nvrhi::BindingLayoutItem::VolatileConstantBuffer(1),
+            nvrhi::BindingLayoutItem::VolatileConstantBuffer(2),
+            nvrhi::BindingLayoutItem::VolatileConstantBuffer(3),
+            nvrhi::BindingLayoutItem::Sampler(1)
+        };
+
+        return m_Device->createBindingLayout(viewLayoutDesc);
+    }
+    
+    virtual nvrhi::BindingSetHandle CreateViewBindingSet() override
+    {
+        if (m_IsShadowPass)
+            return Super::CreateViewBindingSet();
+        
+        nvrhi::BindingSetDesc bindingSetDesc;
+        bindingSetDesc.bindings = {
+            nvrhi::BindingSetItem::ConstantBuffer(1, m_ForwardViewCB),
+            nvrhi::BindingSetItem::ConstantBuffer(2, m_ForwardLightCB),
+            nvrhi::BindingSetItem::ConstantBuffer(3, m_ParallaxShadowCB),
+            nvrhi::BindingSetItem::Sampler(1, m_ShadowSampler)
+        };
+        bindingSetDesc.trackLiveness = m_TrackLiveness;
+
+        return m_Device->createBindingSet(bindingSetDesc, m_ViewBindingLayout);
     }
 };
 
@@ -107,7 +147,7 @@ private:
     RenderPhase m_MainPhase;
     RenderPhase m_ShadowmapPhase;
     
-    uint32_t m_shadowMapSize = 512;
+    uint32_t m_shadowMapSize = 1024;
     
     std::shared_ptr<engine::ShaderFactory> m_ShaderFactory;
     std::unique_ptr<engine::Scene> m_Scene;
@@ -119,7 +159,7 @@ public:
     
     bool Init()
     {
-        std::filesystem::path sceneFileName = app::GetDirectoryWithExecutable().parent_path() / "media/glTF-Sample-Models/2.0/GearboxAssy/glTF/GearboxAssy.gltf";
+        std::filesystem::path sceneFileName = app::GetDirectoryWithExecutable().parent_path() / "media/glTF-Sample-Models/2.0/Buggy/glTF/Buggy.gltf";
         std::filesystem::path frameworkShaderPath = app::GetDirectoryWithExecutable() / "shaders/framework" / app::GetShaderTypeName(GetDevice()->getGraphicsAPI());
         std::filesystem::path appShaderPath = app::GetDirectoryWithExecutable() / "shaders/parallax_shadow_correction" /  app::GetShaderTypeName(GetDevice()->getGraphicsAPI());
         
@@ -142,7 +182,7 @@ public:
         m_SunLight = std::make_shared<engine::DirectionalLight>();
         m_Scene->GetSceneGraph()->AttachLeafNode(m_Scene->GetSceneGraph()->GetRootNode(), m_SunLight);
 
-        m_SunLight->SetDirection(double3(0.1, -1.0, 0.15));
+        m_SunLight->SetDirection(double3(0.0, -1.0, 0.0));
         m_SunLight->irradiance = 1.f;
 
         m_Scene->FinishedLoading(GetFrameIndex());
@@ -281,7 +321,12 @@ public:
         }
 
         auto eyeat = lookat + lightDir * r_max;
-        m_ShadowmapPhase.m_Camera.LookAt(eyeat, lookat, float3(0, 1, 0));
+        auto up = float3(0, 1, 0);
+        if (abs(dot(up, normalize((lookat - eyeat)))) >= 1.0)
+        {
+            up = float3(1, 0, 0);
+        }
+        m_ShadowmapPhase.m_Camera.LookAt(eyeat, lookat, up);
 
         m_ShadowmapPhase.m_View.SetViewport(nvrhi::Viewport(static_cast<float>(m_shadowMapSize), static_cast<float>(m_shadowMapSize)));
         m_ShadowmapPhase.m_View.SetMatrices(m_ShadowmapPhase.m_Camera.GetWorldToViewMatrix(), orthoProjD3DStyle(-r_max, r_max, r_max, -r_max, 0.0, 2 * r_max));
@@ -316,7 +361,15 @@ public:
         commandList->clearTextureFloat(m_MainPhase.m_Framebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(0.f));
 
         render::ForwardShadingPass::Context context;
-         m_MainPhase.m_GeomPass->PrepareLights(context, commandList, m_Scene->GetSceneGraph()->GetLights(), 0.25f, 0.0625f, {});
+        m_MainPhase.m_GeomPass->PrepareLights(context, commandList, m_Scene->GetSceneGraph()->GetLights(), 0.125f, 0.0625f, {});
+        
+        ParallaxShadowCorrectionConstants parallaxConsts;
+        parallaxConsts.cacheLightDir = float4(-float3(m_SunLight->GetDirection()), 0);
+        parallaxConsts.frameLightDir = float4(-float3(m_SunLight->GetDirection()), 0);
+        parallaxConsts.cacheWorldToShadow = m_ShadowmapPhase.m_View.GetViewProjectionMatrix();
+        parallaxConsts.frameWorldToShadow = m_ShadowmapPhase.m_View.GetViewProjectionMatrix();
+        
+        m_MainPhase.m_GeomPass->PreparegParallaxShadow(context, commandList, parallaxConsts, m_ShadowmapPhase.m_Framebuffer->RenderTargets[0]);
         render::RenderCompositeView(commandList, &m_MainPhase.m_View, &m_MainPhase.m_View, *m_MainPhase.m_Framebuffer,
             m_Scene->GetSceneGraph()->GetRootNode(), strategy, * m_MainPhase.m_GeomPass, context);
     }
