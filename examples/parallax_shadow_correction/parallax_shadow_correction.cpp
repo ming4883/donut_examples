@@ -3,6 +3,7 @@
 #include <donut/render/ForwardShadingPass.h>
 #include <donut/app/ApplicationBase.h>
 #include <donut/app/Camera.h>
+#include <donut/app/Timer.h>
 #include <donut/engine/ShaderFactory.h>
 #include <donut/engine/CommonRenderPasses.h>
 #include <donut/engine/TextureCache.h>
@@ -136,6 +137,8 @@ private:
 
     std::unique_ptr<tf::Executor> m_Executor;
 
+    std::chrono::time_point<std::chrono::high_resolution_clock> m_startTime;
+
     struct RenderPhase
     {
         std::shared_ptr<engine::FramebufferFactory> m_Framebuffer;
@@ -143,9 +146,19 @@ private:
         app::FirstPersonCamera m_Camera;
         engine::PlanarView m_View;
     };
+
+    struct ShadowProjState
+    {
+        float m_rotaInDeg = -1;
+        float3 m_lightDir = float3(0, 0, 0);
+        float4x4 m_world2Shadow;
+    };
     
     RenderPhase m_MainPhase;
     RenderPhase m_ShadowmapPhase;
+
+    ShadowProjState m_cacheShadowProj;
+    ShadowProjState m_frameShadowProj;
     
     uint32_t m_shadowMapSize = 1024;
     
@@ -154,12 +167,14 @@ private:
     std::shared_ptr<engine::DirectionalLight> m_SunLight;
     std::unique_ptr<engine::BindingCache> m_BindingCache;
 
+
 public:
     using ApplicationBase::ApplicationBase;
     
     bool Init()
     {
-        std::filesystem::path sceneFileName = app::GetDirectoryWithExecutable().parent_path() / "media/glTF-Sample-Models/2.0/Buggy/glTF/Buggy.gltf";
+        std::filesystem::path sceneFileName = app::GetDirectoryWithExecutable().parent_path() / "media/glTF-Sample-Models/2.0/Duck/glTF/Duck.gltf";
+        std::filesystem::path bgFileName = app::GetDirectoryWithExecutable().parent_path() / "media/glTF-Sample-Models/2.0/TwoSidedPlane/glTF/TwoSidedPlane.gltf";
         std::filesystem::path frameworkShaderPath = app::GetDirectoryWithExecutable() / "shaders/framework" / app::GetShaderTypeName(GetDevice()->getGraphicsAPI());
         std::filesystem::path appShaderPath = app::GetDirectoryWithExecutable() / "shaders/parallax_shadow_correction" /  app::GetShaderTypeName(GetDevice()->getGraphicsAPI());
         
@@ -178,6 +193,7 @@ public:
 
         SetAsynchronousLoadingEnabled(false);
         BeginLoadingScene(nativeFS, sceneFileName);
+        BeginLoadingScene(nativeFS, bgFileName);
 
         m_SunLight = std::make_shared<engine::DirectionalLight>();
         m_Scene->GetSceneGraph()->AttachLeafNode(m_Scene->GetSceneGraph()->GetRootNode(), m_SunLight);
@@ -188,7 +204,7 @@ public:
         m_Scene->FinishedLoading(GetFrameIndex());
         
         auto aabb = m_Scene->GetSceneGraph()->GetRootNode()->GetGlobalBoundingBox();
-        m_MainPhase.m_Camera.LookAt((aabb.m_maxs - aabb.center())* 2.0f + aabb.center(), aabb.center());
+        m_MainPhase.m_Camera.LookAt((aabb.m_maxs - aabb.center()) * 2.0f + aabb.center(), aabb.center());
         m_MainPhase.m_Camera.SetMoveSpeed(length(aabb.m_maxs - aabb.m_mins) * 0.1f);
 
         render::ForwardShadingPass::CreateParameters forwardParams;
@@ -202,6 +218,8 @@ public:
         
         m_CommandList = GetDevice()->createCommandList();
 
+        m_startTime = std::chrono::high_resolution_clock::now();
+
         return true;
     }
 
@@ -209,13 +227,20 @@ public:
     {
         engine::Scene* scene = new engine::Scene(GetDevice(), *m_ShaderFactory, fs, m_TextureCache, nullptr, nullptr);
 
-        if (scene->LoadWithExecutor(sceneFileName, m_Executor.get()))
+        if (!scene->LoadWithExecutor(sceneFileName, m_Executor.get()))
         {
-            m_Scene = std::unique_ptr<engine::Scene>(scene);
-            return true;
+           return false;
         }
 
-        return false;
+        if (!m_Scene)
+        {
+            m_Scene = std::unique_ptr<engine::Scene>(scene);
+        }
+        else
+        {
+            m_Scene->GetSceneGraph()->Attach(m_Scene->GetSceneGraph()->GetRootNode(), scene->GetSceneGraph()->GetRootNode());
+        }
+        return true;
     }
 
     bool KeyboardUpdate(int key, int scancode, int action, int mods) override
@@ -308,8 +333,12 @@ public:
         }
     }
 
-    void SetupShadowMapView(const donut::math::float3& lightDir)
+    float m_CacheThreshold = 5.0f;
+
+    bool SetupShadowMapView()
     {
+        const auto lightDir = m_frameShadowProj.m_lightDir;
+
         auto aabb = m_Scene->GetSceneGraph()->GetRootNode()->GetGlobalBoundingBox();
         auto lookat = aabb.center();
 
@@ -320,33 +349,46 @@ public:
             r_max = donut::math::max(r, r_max);
         }
 
-        auto eyeat = lookat + lightDir * r_max;
+        r_max *= 1.0f;
+
+        auto eyeat = lookat + (lightDir * r_max);
         auto up = float3(0, 1, 0);
         if (abs(dot(up, normalize((lookat - eyeat)))) >= 1.0)
         {
-            up = float3(1, 0, 0);
+            up = float3(0, 0, 1);
         }
         m_ShadowmapPhase.m_Camera.LookAt(eyeat, lookat, up);
 
         m_ShadowmapPhase.m_View.SetViewport(nvrhi::Viewport(static_cast<float>(m_shadowMapSize), static_cast<float>(m_shadowMapSize)));
-        m_ShadowmapPhase.m_View.SetMatrices(m_ShadowmapPhase.m_Camera.GetWorldToViewMatrix(), orthoProjD3DStyle(-r_max, r_max, r_max, -r_max, 0.0, 2 * r_max));
+        m_ShadowmapPhase.m_View.SetMatrices(m_ShadowmapPhase.m_Camera.GetWorldToViewMatrix(), orthoProjD3DStyle(-r_max, r_max, -r_max, r_max, 0.0, r_max * 2));
         m_ShadowmapPhase.m_View.UpdateCache();
+
+        m_frameShadowProj.m_world2Shadow = m_ShadowmapPhase.m_View.GetViewProjectionMatrix();
+
+        if ((m_frameShadowProj.m_rotaInDeg - m_cacheShadowProj.m_rotaInDeg >= m_CacheThreshold) || (m_cacheShadowProj.m_rotaInDeg < 0))
+        {
+            m_cacheShadowProj = m_frameShadowProj;
+            return true;
+        }
+
+        return false;
     }
 
     void RenderShadowMapView(nvrhi::ICommandList* commandList)
     {
-        SetupShadowMapView(-float3(m_SunLight->GetDirection()));
+        if (SetupShadowMapView())
+        {
+            render::InstancedOpaqueDrawStrategy strategy;
 
-        render::InstancedOpaqueDrawStrategy strategy;
+            commandList->clearDepthStencilTexture(m_ShadowmapPhase.m_Framebuffer->DepthTarget, nvrhi::AllSubresources, true, 1.f, true, 0);
+            commandList->clearTextureFloat(m_ShadowmapPhase.m_Framebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(1.f));
 
-        commandList->clearDepthStencilTexture(m_ShadowmapPhase.m_Framebuffer->DepthTarget, nvrhi::AllSubresources, true, 1.f, true, 0);
-        commandList->clearTextureFloat(m_ShadowmapPhase.m_Framebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(1.f));
+            render::ForwardShadingPass::Context context;
+            m_ShadowmapPhase.m_GeomPass->PrepareLights(context, commandList, {}, 0.0f, 0.0f, {});
 
-        render::ForwardShadingPass::Context context;
-        m_ShadowmapPhase.m_GeomPass->PrepareLights(context, commandList, {}, 0.0f, 0.0f, {});
-
-        render::RenderCompositeView(commandList, &m_ShadowmapPhase.m_View, &m_ShadowmapPhase.m_View, *m_ShadowmapPhase.m_Framebuffer,
-            m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ShadowmapPhase.m_GeomPass, context);
+            render::RenderCompositeView(commandList, &m_ShadowmapPhase.m_View, &m_ShadowmapPhase.m_View, *m_ShadowmapPhase.m_Framebuffer,
+                m_Scene->GetSceneGraph()->GetRootNode(), strategy, *m_ShadowmapPhase.m_GeomPass, context);
+        }
     }
 
     void RenderSceneView(nvrhi::ICommandList* commandList, const nvrhi::Viewport& viewport)
@@ -361,17 +403,30 @@ public:
         commandList->clearTextureFloat(m_MainPhase.m_Framebuffer->RenderTargets[0], nvrhi::AllSubresources, nvrhi::Color(0.f));
 
         render::ForwardShadingPass::Context context;
-        m_MainPhase.m_GeomPass->PrepareLights(context, commandList, m_Scene->GetSceneGraph()->GetLights(), 0.125f, 0.0625f, {});
+        m_MainPhase.m_GeomPass->PrepareLights(context, commandList, m_Scene->GetSceneGraph()->GetLights(), 1.0/16.0f, 1/32.0f, {});
         
         ParallaxShadowCorrectionConstants parallaxConsts;
-        parallaxConsts.cacheLightDir = float4(-float3(m_SunLight->GetDirection()), 0);
-        parallaxConsts.frameLightDir = float4(-float3(m_SunLight->GetDirection()), 0);
-        parallaxConsts.cacheWorldToShadow = m_ShadowmapPhase.m_View.GetViewProjectionMatrix();
-        parallaxConsts.frameWorldToShadow = m_ShadowmapPhase.m_View.GetViewProjectionMatrix();
+        parallaxConsts.cacheLightDir = float4(m_cacheShadowProj.m_lightDir, 0);
+        parallaxConsts.frameLightDir = float4(m_frameShadowProj.m_lightDir, 0);
+        parallaxConsts.cacheWorldToShadow = m_cacheShadowProj.m_world2Shadow;
+        parallaxConsts.frameWorldToShadow = m_frameShadowProj.m_world2Shadow;
         
         m_MainPhase.m_GeomPass->PreparegParallaxShadow(context, commandList, parallaxConsts, m_ShadowmapPhase.m_Framebuffer->RenderTargets[0]);
         render::RenderCompositeView(commandList, &m_MainPhase.m_View, &m_MainPhase.m_View, *m_MainPhase.m_Framebuffer,
             m_Scene->GetSceneGraph()->GetRootNode(), strategy, * m_MainPhase.m_GeomPass, context);
+    }
+
+    void UpdateLightDir()
+    {
+        const auto appTime = std::chrono::high_resolution_clock::now() - m_startTime;
+        const auto appTimeInSec = std::chrono::duration_cast<std::chrono::nanoseconds>(appTime).count() * 1e-9;
+        
+        m_frameShadowProj.m_rotaInDeg = static_cast<float>(appTimeInSec) * 2.0f;
+
+        const float rot = math::radians(m_frameShadowProj.m_rotaInDeg);
+        m_frameShadowProj.m_lightDir = normalize(float3(cos(rot), 0.5f, sin(rot)));
+        
+        m_SunLight->SetDirection(-double3(m_frameShadowProj.m_lightDir));
     }
     
     void Render(nvrhi::IFramebuffer* framebuffer) override
@@ -380,6 +435,8 @@ public:
 
         EnsureFramebuffers(fbinfo);
 
+        UpdateLightDir();
+        
         nvrhi::ICommandList* commandList = m_CommandList;
         commandList->open();
 

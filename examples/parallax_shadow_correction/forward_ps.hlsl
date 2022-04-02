@@ -111,7 +111,7 @@ void main(
     shadowPos.xyz /= shadowPos.www;
 
     float4 shadowCasterZ = t_ShadowMap.Sample(s_ShadowSampler, shadowPos.xy * 0.5 + 0.5);
-    float shadowTerm = shadowCasterZ.x < (shadowPos.z - 1e-2) ? 0 : 1;
+    float shadowTerm = shadowCasterZ.x < (shadowPos.z - 1e-5) ? 0 : 1;
     diffuseTerm.xyz *= shadowTerm;
     specularTerm.xyz *= shadowTerm;
     
